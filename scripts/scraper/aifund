@@ -194,13 +194,11 @@ def load_saved_urls() -> set[str]:
 # Main pipeline
 # -----------------------
 def build_url_list() -> list[str]:
-    print("=== Sammle URLs ===")
+    print("=== Collect URLs ===")
     all_urls = set()
 
     print("[1/1] Sitemap-Index...")
     all_urls.update(collect_urls_from_sitemaps())
-
-    # Irrelevante Seiten rausfiltern
     all_urls = {u for u in all_urls if not any(x in u for x in [
         "/author/", "/tag/", "/category/", "/page/", "/team/",
         "/wp-content/",
@@ -208,7 +206,7 @@ def build_url_list() -> list[str]:
         ".jpg", ".jpeg", ".png", ".gif", ".svg", ".pdf", ".mp4", ".mp3"
     ))}
 
-    print(f"→ {len(all_urls)} URLs insgesamt (vor Filter)")
+    print(f"→ {len(all_urls)} all URLs (before filter)")
     return sorted(all_urls)
 
 def keyword_match(doc: dict, keywords: list[str]) -> bool:
@@ -217,10 +215,10 @@ def keyword_match(doc: dict, keywords: list[str]) -> bool:
 
 def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
     urls = build_url_list()
-    print(f"\n=== Scrape startet: {len(urls)} URLs ===\n")
+    print(f"\n=== start Scrape: {len(urls)} URLs ===\n")
 
     saved_urls = load_saved_urls()
-    print(f"  Bereits gespeichert: {len(saved_urls)} Dokumente\n")
+    print(f"  already saved: {len(saved_urls)} Documents\n")
 
     collected = 0
     skipped_short = 0
@@ -236,7 +234,7 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
         print(f"[{i+1}/{len(urls)}] {url}")
         html = fetch_url(url)
         if not html:
-            print("  → Nicht erreichbar, übersprungen")
+            print("  → unavailable, skipped")
             continue
 
         doc = extract_doc(url, html)
@@ -253,18 +251,18 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
         saved_urls.add(url)
         collected += 1
         lang = doc.get("language", "?")
-        print(f"  ✓ gespeichert [{lang}] | {doc['char_count']} Zeichen | {doc['published_time']}")
+        print(f"  ✓ Saved [{lang}] | {doc['char_count']} Sign | {doc['published_time']}")
 
-    print(f"\n=== Fertig ===")
-    print(f"  Gespeichert:         {collected}")
-    print(f"  Übersprungen (kurz): {skipped_short}")
-    print(f"  Kein Keyword-Match:  {skipped_keyword}")
+    print(f"\n=== Done ===")
+    print(f"  Saved:         {collected}")
+    print(f"  Skipped (kurz): {skipped_short}")
+    print(f"  No Keyword-Match:  {skipped_keyword}")
 
     # Übersicht nach Sprache
     for label, out_file in [("EN", OUT_JSONL_EN), ("DE", OUT_JSONL_DE), ("Other", OUT_JSONL_OTHER)]:
         if out_file.exists():
             count = sum(1 for _ in out_file.open(encoding="utf-8"))
-            print(f"  {label}: {count} Dokumente → {out_file.name}")
+            print(f"  {label}: {count} Documents → {out_file.name}")
 
 if __name__ == "__main__":
     # Erst testen:

@@ -1,21 +1,20 @@
 import json
 import time
 import hashlib
-import re
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
 import trafilatura
-from trafilatura.settings import use_config
 
 # -----------------------
 # Configuration
 # -----------------------
 USER_AGENT = "MasterThesisResearchOx/1.0 (contact: franziska.b.m.schaefer@gmail.com)"
 HEADERS = {"User-Agent": USER_AGENT}
-OUT_DIR = Path("a16z_corpus")
+OUT_DIR = Path("andressen_corpus")
 CACHE_DIR = OUT_DIR / "cache_html"
 OUT_JSONL = OUT_DIR / "documents.jsonl"
 
@@ -25,7 +24,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 REQUEST_SLEEP_SEC = 2.0
 TIMEOUT = 30
 
-# --- Sitemap-Index ---
+# Sitemap index URL
 SITEMAP_INDEX = "https://a16z.com/sitemap_index.xml"
 
 # Whitelist: only scrape relevant partial sitemaps
@@ -37,15 +36,24 @@ RELEVANT_SITEMAPS = {
     "https://a16z.com/guest-author-sitemap2.xml",
     "https://a16z.com/guest-author-sitemap3.xml",
     "https://a16z.com/announcement-sitemap.xml",
-    # "https://a16z.com/defense-sitemap.xml", # Gov/Defence
+    # "https://a16z.com/defense-sitemap.xml",  # uncomment if gov/defense in scope
 }
 
 # Category archive pages with pagination
 CATEGORY_PAGES = [
-    "https://a16z.com/ai/",              # directly AI pre-filtered
-    "https://a16z.com/news-content/",    # a16z News & Updates
+    "https://a16z.com/ai/",           # pre-filtered AI content
+    "https://a16z.com/news-content/", # a16z news & updates
 ]
-MAX_PAGES_PER_CATEGORY = 20  # Safety brake against endless pagination
+MAX_PAGES_PER_CATEGORY = 20  # safety brake against endless pagination
+
+# File extensions to skip entirely
+SKIP_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
+    ".pdf", ".mp4", ".mp3", ".zip", ".gz"
+)
+
+# Domains to skip (CDN image hosts, etc.)
+SKIP_DOMAINS = {"cloudfront.net", "cdn.a16z.com"}
 
 AI_KEYWORDS = [
     "ai", "artificial intelligence", "llm", "agent", "machine learning",
@@ -60,8 +68,25 @@ def url_to_cache_path(url: str) -> Path:
     h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
     return CACHE_DIR / f"{h}.html"
 
+def is_skippable_url(url: str) -> bool:
+    """Returns True if the URL points to a media file or CDN asset that should be skipped."""
+    url_lower = url.lower().split("?")[0]
+    if url_lower.endswith(SKIP_EXTENSIONS):
+        return True
+    parsed = urlparse(url)
+    if any(domain in parsed.netloc for domain in SKIP_DOMAINS):
+        return True
+    return False
+
 def fetch_url(url: str, retries: int = 3) -> str | None:
-    """Fetch with caching + retry."""
+    """Fetch URL with local HTML cache and retry logic.
+    Returns HTML string or None if unavailable.
+    Skips media files and CDN assets entirely.
+    """
+    # Skip media/CDN URLs before any network request
+    if is_skippable_url(url):
+        return None
+
     cache_path = url_to_cache_path(url)
     if cache_path.exists():
         return cache_path.read_text(encoding="utf-8", errors="ignore")
@@ -70,7 +95,7 @@ def fetch_url(url: str, retries: int = 3) -> str | None:
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code == 404:
-                return None  # No Retry when 404
+                return None  # no retry on 404
             if r.status_code != 200:
                 time.sleep(REQUEST_SLEEP_SEC * (attempt + 1))
                 continue
@@ -79,35 +104,33 @@ def fetch_url(url: str, retries: int = 3) -> str | None:
             time.sleep(REQUEST_SLEEP_SEC)
             return html
         except requests.RequestException as e:
-            print(f"  [Error] {url}: {e} (Try {attempt+1}/{retries})")
+            print(f"  [Error] {url}: {e} (attempt {attempt+1}/{retries})")
             time.sleep(REQUEST_SLEEP_SEC * (attempt + 1))
     return None
 
 # -----------------------
-# URL-Collection: Sitemap-Index
+# URL Collection: Sitemap Index
 # -----------------------
 def parse_sitemap(xml_text: str) -> list[str]:
-    """Parses both sitemap indexes and normal sitemaps"""
+    """Parses both sitemap indexes and regular sitemaps, returns list of <loc> URLs."""
     soup = BeautifulSoup(xml_text, "xml")
     return [loc.get_text(strip=True) for loc in soup.find_all("loc")]
 
 def collect_urls_from_sitemaps() -> set[str]:
-    """Loads sitemap index → only relevant partial sitemaps → all URLs"""
+    """Loads sitemap index, filters to whitelisted partial sitemaps, returns all article URLs."""
     urls = set()
     index_xml = fetch_url(SITEMAP_INDEX)
     if not index_xml:
-        print("[Sitemap index not accessible]")
+        print("  [Warning] Sitemap index not accessible")
         return urls
 
     sub_sitemaps = parse_sitemap(index_xml)
-    print(f"  {len(sub_sitemaps)} Partial sitemaps found in the index")
+    print(f"  {len(sub_sitemaps)} partial sitemaps found in index")
 
     for sm_url in sub_sitemaps:
-        if sm_url not in RELEVANT_SITEMAPS:  # Whitelist instead of Blacklist
+        if sm_url not in RELEVANT_SITEMAPS:
             continue
-        print(f"  load Sitemap: {sm_url}")
-        xml = fetch_url(sm_url)
-        # NEW:
+        print(f"  Loading sitemap: {sm_url}")
         xml = fetch_url(sm_url)
         if xml:
             found = [u for u in parse_sitemap(xml) if u.startswith("https://")]
@@ -117,57 +140,61 @@ def collect_urls_from_sitemaps() -> set[str]:
     return urls
 
 # -----------------------
-# URL-Collection: Category sites
+# URL Collection: Category Pages
 # -----------------------
 def collect_urls_from_category_pages() -> set[str]:
-    """
-    Crawls category/archive pages with pagination
-    Extracts all internal article links
-    URLs from /ai/ are already pre-filtered → no keyword filter necessary
+    """Crawls category/archive pages with WordPress pagination.
+    Extracts all internal article links.
+    URLs from /ai/ are already pre-filtered by topic.
     """
     urls = set()
     base_domain = "a16z.com"
 
     for base_url in CATEGORY_PAGES:
-        print(f"  Crawle Category: {base_url}")
+        print(f"  Crawling category: {base_url}")
         for page_num in range(1, MAX_PAGES_PER_CATEGORY + 1):
-            # WordPress Standard-Pagination
+            # WordPress standard pagination pattern
             page_url = base_url if page_num == 1 else f"{base_url}page/{page_num}/"
 
             html = fetch_url(page_url)
             if not html:
-                break
+                break  # no more pages
+
             soup = BeautifulSoup(html, "html.parser")
 
-            # Extract article links
             found_on_page = set()
             for a in soup.find_all("a", href=True):
                 href = urljoin(base_url, a["href"])
-                # Filter out broken URLs
                 if not href.startswith("https://"):
                     continue
                 parsed = urlparse(href)
-                # Only internal links, no category pages themselves
+                # Only internal article links — skip category/tag/pagination pages
                 if (parsed.netloc.endswith(base_domain)
                         and parsed.path.count("/") >= 2
-                        and not any(x in parsed.path for x in ["/category/", "/tag/", "/page/", "/author/"])
+                        and not any(x in parsed.path for x in [
+                            "/category/", "/tag/", "/page/", "/author/"
+                        ])
                         and not parsed.path.endswith("/")
-                        ):
-                    found_on_page.add(href.split("?")[0].split("#")[0])  # Remove UTM parameters
+                        and not is_skippable_url(href)):
+                    # Strip UTM and tracking parameters
+                    found_on_page.add(href.split("?")[0].split("#")[0])
 
             if not found_on_page:
-                break
+                break  # pagination exhausted
 
             urls.update(found_on_page)
-            print(f"    Site {page_num}: {len(found_on_page)} Links")
+            print(f"    Page {page_num}: {len(found_on_page)} links")
 
     return urls
 
 # -----------------------
-# Text-Extraction
+# Text Extraction
 # -----------------------
 def extract_doc(url: str, html: str) -> dict:
-    """Extracts text + metadata"""
+    """Extracts main text and metadata from HTML.
+    Uses trafilatura as primary extractor with BeautifulSoup fallbacks for metadata.
+    Note: trafilatura.bare_extraction() returns an object (dot notation), not a dict.
+    """
     traf_result = trafilatura.bare_extraction(
         html,
         include_comments=False,
@@ -175,36 +202,39 @@ def extract_doc(url: str, html: str) -> dict:
         with_metadata=True,
     )
 
-    if traf_result and isinstance(traf_result, dict):
-        text = traf_result.get("text", "") or ""
-        title = traf_result.get("title", "") or ""
-        date = traf_result.get("date", "") or ""
-        author = traf_result.get("author", "") or ""
-        tags = traf_result.get("tags", "") or ""
+    if traf_result:
+        # trafilatura returns an object — use dot notation (not dict .get())
+        text = traf_result.text or ""
+        title = traf_result.title or ""
+        date = traf_result.date or ""
+        author = traf_result.author or ""
+        tags = traf_result.tags or ""
     else:
-        # Fallback: extract directly
+        # Fallback: plain extraction + BeautifulSoup for title
         text = trafilatura.extract(html, include_comments=False) or ""
         soup = BeautifulSoup(html, "html.parser")
         title = soup.title.get_text(strip=True) if soup.title else ""
         date, author, tags = "", "", ""
 
-    # Date fallback via meta tags
+    # Date fallback: check common meta tags if trafilatura didn't find one
     if not date:
         soup = BeautifulSoup(html, "html.parser")
         for prop in ["article:published_time", "published_time", "og:updated_time"]:
-            tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+            tag = (soup.find("meta", attrs={"property": prop})
+                   or soup.find("meta", attrs={"name": prop}))
             if tag and tag.get("content"):
                 date = tag["content"].strip()
                 break
 
-        # Subheader / Preview Title
-    if traf_result and hasattr(traf_result, 'description') and traf_result.description:
+    # Subtitle: prefer trafilatura description, fall back to Open Graph / Twitter meta tags
+    if traf_result and hasattr(traf_result, "description") and traf_result.description:
         subtitle = traf_result.description or ""
     else:
         soup = BeautifulSoup(html, "html.parser")
         subtitle = ""
         for prop in ["og:description", "description", "twitter:description"]:
-            tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+            tag = (soup.find("meta", attrs={"property": prop})
+                   or soup.find("meta", attrs={"name": prop}))
             if tag and tag.get("content"):
                 subtitle = tag["content"].strip()
                 break
@@ -222,12 +252,16 @@ def extract_doc(url: str, html: str) -> dict:
         "char_count": len(text.strip()),
     }
 
+# -----------------------
+# Storage
+# -----------------------
 def save_jsonl(record: dict):
+    """Appends a single document record to the JSONL output file."""
     with OUT_JSONL.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-# Duplicate check: In-memory set for performance with large numbers of documents
 def load_saved_urls() -> set[str]:
+    """Loads all previously saved URLs into a set for fast duplicate checking."""
     saved = set()
     if not OUT_JSONL.exists():
         return saved
@@ -240,37 +274,49 @@ def load_saved_urls() -> set[str]:
     return saved
 
 # -----------------------
-# Main pipeline
+# Main Pipeline
 # -----------------------
 def build_url_list() -> list[str]:
-    print("=== Collect URLs ===")
+    """Collects all candidate URLs from sitemaps and category pages,
+    then filters out irrelevant paths and media files.
+    """
+    print("=== Collecting URLs ===")
     all_urls = set()
 
-    print("[1/2] Sitemap-Index...")
+    print("[1/2] Sitemap index...")
     all_urls.update(collect_urls_from_sitemaps())
 
-    print("[2/2] Category-Sites...")
+    print("[2/2] Category pages...")
     all_urls.update(collect_urls_from_category_pages())
 
-    # filter out irrelevant pages
-    all_urls = {u for u in all_urls if not any(x in u for x in [
-        "/author/", "/tag/", "/category/", "/page/", "/event/", "/book/"
-    ])}
+    # Filter out non-article pages and media assets
+    all_urls = {
+        u for u in all_urls
+        if not any(x in u for x in [
+            "/author/", "/tag/", "/category/", "/page/",
+            "/event/", "/book/", "cloudfront.net",
+        ])
+        and not is_skippable_url(u)
+    }
 
-    print(f"→ {len(all_urls)} all URLs (before filter)")
+    print(f"→ {len(all_urls)} URLs total (after filter)")
     return sorted(all_urls)
 
 def keyword_match(doc: dict, keywords: list[str]) -> bool:
+    """Returns True if any keyword appears in the document title or text."""
     hay = (doc["title"] + " " + doc["text"]).lower()
     return any(k.lower() in hay for k in keywords)
 
 def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
+    """Main scraping loop.
+    Fetches each URL, extracts text, applies filters, and saves to JSONL.
+    Resumes automatically if output file already exists.
+    """
     urls = build_url_list()
-    print(f"\n=== start Scrape: {len(urls)} URLs ===\n")
+    print(f"\n=== Scraping: {len(urls)} URLs ===\n")
 
-    # Load duplicates once
     saved_urls = load_saved_urls()
-    print(f"  already saved: {len(saved_urls)} Documents\n")
+    print(f"  Already saved: {len(saved_urls)} documents\n")
 
     collected = 0
     skipped_short = 0
@@ -286,15 +332,17 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
         print(f"[{i+1}/{len(urls)}] {url}")
         html = fetch_url(url)
         if not html:
-            print("  → Unavailable, skipped")
+            print("  → Unavailable, skipping")
             continue
 
         doc = extract_doc(url, html)
 
+        # Filter 1: minimum text length
         if doc["char_count"] < 500:
             skipped_short += 1
             continue
 
+        # Filter 2: AI keyword relevance (optional)
         if apply_keyword_filter and not keyword_match(doc, AI_KEYWORDS):
             skipped_keyword += 1
             continue
@@ -302,17 +350,16 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
         save_jsonl(doc)
         saved_urls.add(url)
         collected += 1
-        print(f"  ✓ saved | {doc['char_count']} Sign | {doc['published_time']}")
+        print(f"  ✓ saved | {doc['char_count']} chars | {doc['published_time']}")
 
     print(f"\n=== Done ===")
-    print(f"  Saved:         {collected}")
-    print(f"  Skipped (short): {skipped_short}")
-    print(f"  No Keyword-Match:  {skipped_keyword}")
+    print(f"  Saved:              {collected}")
+    print(f"  Skipped (too short): {skipped_short}")
+    print(f"  Skipped (no keyword): {skipped_keyword}")
 
 if __name__ == "__main__":
+    # Test run (10 docs, no keyword filter):
+    # run_scrape(max_docs=10, apply_keyword_filter=False)
 
-     # Test Run:
-     # run_scrape(max_docs=10, apply_keyword_filter=False)
-
-     # Full Run:
-     run_scrape(max_docs=1000, apply_keyword_filter=True)
+    # Full run:
+    run_scrape(max_docs=1000, apply_keyword_filter=True)

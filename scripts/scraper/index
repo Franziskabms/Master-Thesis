@@ -60,12 +60,12 @@ def fetch_url(url: str, retries: int = 3) -> str | None:
             time.sleep(REQUEST_SLEEP_SEC)
             return html
         except requests.RequestException as e:
-            print(f"  [Error] {url}: {e} (Try {attempt+1}/{retries})")
+            print(f"  [Error] {url}: {e} (attempt {attempt+1}/{retries})")
             time.sleep(REQUEST_SLEEP_SEC * (attempt + 1))
     return None
 
 # -----------------------
-# URL-Collection: Wayback CDX API
+# URL Collection: Wayback CDX API
 # -----------------------
 def collect_urls_from_cdx() -> set[str]:
     urls = set()
@@ -91,18 +91,22 @@ def collect_urls_from_cdx() -> set[str]:
                 if not url.startswith("http"):
                     continue
 
-                # Only real articles (no .html, .php, etc.)
-                if any(path.endswith(ext) for ext in [".html", ".php", ".gif", ".jpg", ".png", ".pdf"]):
-                    continue
-
-                # Only /perspectives/ subpaths with real article names
+                # Only /perspectives/ subpaths
                 if not parsed.path.startswith("/perspectives/"):
                     continue
 
+                # Skip non-article subpages
+                if any(x in path for x in ["/relationship/", "/team-member/"]):
+                    continue
+
+                # Skip media files
+                if any(path.endswith(ext) for ext in [".html", ".php", ".gif", ".jpg", ".png", ".pdf"]):
+                    continue
+
+                # Must have a real article slug (at least 3 path segments)
                 if len(path.split("/")) < 3:
                     continue
 
-                # Remove UTM and other parameters
                 clean_url = f"https://www.indexventures.com{path}"
                 urls.add(clean_url)
 
@@ -113,7 +117,7 @@ def collect_urls_from_cdx() -> set[str]:
     return urls
 
 # -----------------------
-# Text-Extraction
+# Text Extraction
 # -----------------------
 def extract_doc(url: str, html: str) -> dict:
     traf_result = trafilatura.bare_extraction(
@@ -135,22 +139,25 @@ def extract_doc(url: str, html: str) -> dict:
         title = soup.title.get_text(strip=True) if soup.title else ""
         date, author, tags = "", "", ""
 
+    # Date fallback via meta tags
     if not date:
         soup = BeautifulSoup(html, "html.parser")
         for prop in ["article:published_time", "published_time", "og:updated_time"]:
-            tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+            tag = (soup.find("meta", attrs={"property": prop})
+                   or soup.find("meta", attrs={"name": prop}))
             if tag and tag.get("content"):
                 date = tag["content"].strip()
                 break
 
-    # Subheader / Preview Title
-    if traf_result and hasattr(traf_result, 'description') and traf_result.description:
+    # Subtitle fallback via Open Graph / Twitter meta tags
+    if traf_result and hasattr(traf_result, "description") and traf_result.description:
         subtitle = traf_result.description or ""
     else:
         soup = BeautifulSoup(html, "html.parser")
         subtitle = ""
         for prop in ["og:description", "description", "twitter:description"]:
-            tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+            tag = (soup.find("meta", attrs={"property": prop})
+                   or soup.find("meta", attrs={"name": prop}))
             if tag and tag.get("content"):
                 subtitle = tag["content"].strip()
                 break
@@ -168,6 +175,9 @@ def extract_doc(url: str, html: str) -> dict:
         "char_count": len(text.strip()),
     }
 
+# -----------------------
+# Storage
+# -----------------------
 def save_jsonl(record: dict):
     with OUT_JSONL.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -185,13 +195,12 @@ def load_saved_urls() -> set[str]:
     return saved
 
 # -----------------------
-# Main pipeline
+# Main Pipeline
 # -----------------------
 def build_url_list() -> list[str]:
-    print("=== Collect URLs via Wayback CDX API ===")
+    print("=== Collecting URLs via Wayback CDX API ===")
     all_urls = collect_urls_from_cdx()
-
-    print(f"→ {len(all_urls)} all URLs (before filter)")
+    print(f"→ {len(all_urls)} URLs total")
     return sorted(all_urls)
 
 def keyword_match(doc: dict, keywords: list[str]) -> bool:
@@ -200,10 +209,10 @@ def keyword_match(doc: dict, keywords: list[str]) -> bool:
 
 def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
     urls = build_url_list()
-    print(f"\n=== start Scrape: {len(urls)} URLs ===\n")
+    print(f"\n=== Scraping: {len(urls)} URLs ===\n")
 
     saved_urls = load_saved_urls()
-    print(f"  saved already: {len(saved_urls)} Documents\n")
+    print(f"  Already saved: {len(saved_urls)} documents\n")
 
     collected = 0
     skipped_short = 0
@@ -224,10 +233,12 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
 
         doc = extract_doc(url, html)
 
+        # Filter 1: minimum text length
         if doc["char_count"] < 500:
             skipped_short += 1
             continue
 
+        # Filter 2: AI keyword relevance (optional)
         if apply_keyword_filter and not keyword_match(doc, AI_KEYWORDS):
             skipped_keyword += 1
             continue
@@ -235,17 +246,17 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
         save_jsonl(doc)
         saved_urls.add(url)
         collected += 1
-        print(f"  ✓ saved | {doc['char_count']} Sign | {doc['published_time']}")
+        print(f"  ✓ saved | {doc['char_count']} chars | {doc['published_time']}")
 
-    print(f"\n=== Fertig ===")
-    print(f"  Saved:         {collected}")
-    print(f"  Skipped (short): {skipped_short}")
-    print(f"  No Keyword-Match:  {skipped_keyword}")
+    print(f"\n=== Done ===")
+    print(f"  Saved:                {collected}")
+    print(f"  Skipped (too short):  {skipped_short}")
+    print(f"  Skipped (no keyword): {skipped_keyword}")
 
 if __name__ == "__main__":
 
-    # Test Run:
+    # Test run:
     # run_scrape(max_docs=10, apply_keyword_filter=False)
 
-    # Full Run:
-     run_scrape(max_docs=10000, apply_keyword_filter=True)
+    # Full run:
+    run_scrape(max_docs=10000, apply_keyword_filter=True)

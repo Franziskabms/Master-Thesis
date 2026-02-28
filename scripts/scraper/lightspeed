@@ -3,7 +3,7 @@ import time
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 import trafilatura
@@ -23,22 +23,33 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 REQUEST_SLEEP_SEC = 2.0
 TIMEOUT = 30
 
-# --- Sitemap-Index ---
+# Sitemap index URL
 SITEMAP_INDEX = "https://lsvp.com/sitemap_index.xml"
 
+# Whitelist: only scrape relevant partial sitemaps
 RELEVANT_SITEMAPS = {
     "https://lsvp.com/post-sitemap.xml",
     "https://lsvp.com/newsletter-sitemap.xml",
 }
-
-CATEGORY_PAGES = []  # no relevant category archive pages
-MAX_PAGES_PER_CATEGORY = 20
 
 AI_KEYWORDS = [
     "ai", "artificial intelligence", "llm", "agent", "machine learning",
     "foundation model", "generative", "gpt", "deep learning", "automation",
     "model", "intelligence", "software",
 ]
+
+# URL path segments that indicate non-article pages
+SKIP_PATH_SEGMENTS = [
+    "/author/", "/tag/", "/category/", "/page/", "/team/",
+    "/company/", "/founder/", "/collection/", "/media/",
+    "/wp-content/", "/event/", "/gallery/", "/firm/",
+]
+
+# File extensions to skip
+SKIP_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".svg",
+    ".pdf", ".mp4", ".mp3", ".webp", ".zip"
+)
 
 # -----------------------
 # Helpers
@@ -48,6 +59,9 @@ def url_to_cache_path(url: str) -> Path:
     return CACHE_DIR / f"{h}.html"
 
 def fetch_url(url: str, retries: int = 3) -> str | None:
+    """Fetch URL with local HTML cache and retry logic.
+    Returns HTML string or None if unavailable.
+    """
     cache_path = url_to_cache_path(url)
     if cache_path.exists():
         return cache_path.read_text(encoding="utf-8", errors="ignore")
@@ -56,7 +70,7 @@ def fetch_url(url: str, retries: int = 3) -> str | None:
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code == 404:
-                return None
+                return None  # no retry on 404
             if r.status_code != 200:
                 time.sleep(REQUEST_SLEEP_SEC * (attempt + 1))
                 continue
@@ -65,22 +79,24 @@ def fetch_url(url: str, retries: int = 3) -> str | None:
             time.sleep(REQUEST_SLEEP_SEC)
             return html
         except requests.RequestException as e:
-            print(f"  [Error] {url}: {e} (Try {attempt+1}/{retries})")
+            print(f"  [Error] {url}: {e} (attempt {attempt+1}/{retries})")
             time.sleep(REQUEST_SLEEP_SEC * (attempt + 1))
     return None
 
 # -----------------------
-# URL-Collection: Sitemaps
+# URL Collection: Sitemap Index
 # -----------------------
 def parse_sitemap(xml_text: str) -> list[str]:
+    """Parses both sitemap indexes and regular sitemaps, returns list of <loc> URLs."""
     soup = BeautifulSoup(xml_text, "xml")
     return [loc.get_text(strip=True) for loc in soup.find_all("loc")]
 
 def collect_urls_from_sitemaps() -> set[str]:
+    """Loads sitemap index, filters to whitelisted partial sitemaps, returns all article URLs."""
     urls = set()
     index_xml = fetch_url(SITEMAP_INDEX)
     if not index_xml:
-        print("[sitemap index unavailable]")
+        print("  [Warning] Sitemap index unavailable")
         return urls
 
     sub_sitemaps = parse_sitemap(index_xml)
@@ -89,19 +105,23 @@ def collect_urls_from_sitemaps() -> set[str]:
     for sm_url in sub_sitemaps:
         if sm_url not in RELEVANT_SITEMAPS:
             continue
-        print(f" load Sitemap: {sm_url}")
+        print(f"  Loading sitemap: {sm_url}")
         xml = fetch_url(sm_url)
         if xml:
             found = [u for u in parse_sitemap(xml) if u.startswith("https://")]
             urls.update(found)
-            print(f"   → {len(found)} URLs")
+            print(f"    → {len(found)} URLs")
 
     return urls
 
 # -----------------------
-# Text-Extraction
+# Text Extraction
 # -----------------------
 def extract_doc(url: str, html: str) -> dict:
+    """Extracts main text and metadata from HTML.
+    Uses trafilatura as primary extractor with BeautifulSoup fallbacks for metadata.
+    Note: trafilatura.bare_extraction() returns an object (dot notation), not a dict.
+    """
     traf_result = trafilatura.bare_extraction(
         html,
         include_comments=False,
@@ -121,22 +141,25 @@ def extract_doc(url: str, html: str) -> dict:
         title = soup.title.get_text(strip=True) if soup.title else ""
         date, author, tags = "", "", ""
 
+    # Date fallback: check common meta tags if trafilatura didn't find one
     if not date:
         soup = BeautifulSoup(html, "html.parser")
         for prop in ["article:published_time", "published_time", "og:updated_time"]:
-            tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+            tag = (soup.find("meta", attrs={"property": prop})
+                   or soup.find("meta", attrs={"name": prop}))
             if tag and tag.get("content"):
                 date = tag["content"].strip()
                 break
 
-    # Subheader / Preview Title
-    if traf_result and hasattr(traf_result, 'description') and traf_result.description:
+    # Subtitle: prefer trafilatura description, fall back to Open Graph / Twitter meta tags
+    if traf_result and hasattr(traf_result, "description") and traf_result.description:
         subtitle = traf_result.description or ""
     else:
         soup = BeautifulSoup(html, "html.parser")
         subtitle = ""
         for prop in ["og:description", "description", "twitter:description"]:
-            tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+            tag = (soup.find("meta", attrs={"property": prop})
+                   or soup.find("meta", attrs={"name": prop}))
             if tag and tag.get("content"):
                 subtitle = tag["content"].strip()
                 break
@@ -154,11 +177,16 @@ def extract_doc(url: str, html: str) -> dict:
         "char_count": len(text.strip()),
     }
 
+# -----------------------
+# Storage
+# -----------------------
 def save_jsonl(record: dict):
+    """Appends a single document record to the JSONL output file."""
     with OUT_JSONL.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def load_saved_urls() -> set[str]:
+    """Loads all previously saved URLs into a set for fast duplicate checking."""
     saved = set()
     if not OUT_JSONL.exists():
         return saved
@@ -171,37 +199,41 @@ def load_saved_urls() -> set[str]:
     return saved
 
 # -----------------------
-# Main pipeline
+# Main Pipeline
 # -----------------------
 def build_url_list() -> list[str]:
-    print("=== collect URLs ===")
+    """Collects all candidate URLs from sitemaps, then filters out non-article pages."""
+    print("=== Collecting URLs ===")
     all_urls = set()
 
-    print("[1/1] Sitemap-Index...")
+    print("[1/1] Sitemap index...")
     all_urls.update(collect_urls_from_sitemaps())
 
-    # Filter out irrelevant pages
-    all_urls = {u for u in all_urls if not any(x in u for x in [
-        "/author/", "/tag/", "/category/", "/page/", "/team/",
-        "/company/", "/founder/", "/collection/", "/media/",
-        "/wp-content/", "/event/", "/gallery/", "/firm/",
-    ]) and not u.split("?")[0].endswith((
-        ".jpg", ".jpeg", ".png", ".gif", ".svg", ".pdf", ".mp4", ".mp3"
-    ))}
+    # Filter out non-article pages and media files
+    all_urls = {
+        u for u in all_urls
+        if not any(seg in u for seg in SKIP_PATH_SEGMENTS)
+        and not u.split("?")[0].lower().endswith(SKIP_EXTENSIONS)
+    }
 
-    print(f"→ {len(all_urls)} all URLs (before filter)")
+    print(f"→ {len(all_urls)} URLs total (after filter)")
     return sorted(all_urls)
 
 def keyword_match(doc: dict, keywords: list[str]) -> bool:
+    """Returns True if any keyword appears in the document title or text."""
     hay = (doc["title"] + " " + doc["text"]).lower()
     return any(k.lower() in hay for k in keywords)
 
-def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
+def run_scrape(max_docs: int = 1000, apply_keyword_filter: bool = True):
+    """Main scraping loop.
+    Fetches each URL, extracts text, applies filters, and saves to JSONL.
+    Resumes automatically if output file already exists.
+    """
     urls = build_url_list()
-    print(f"\n=== start Scrape: {len(urls)} URLs ===\n")
+    print(f"\n=== Scraping: {len(urls)} URLs ===\n")
 
     saved_urls = load_saved_urls()
-    print(f" saved already: {len(saved_urls)} Documents\n")
+    print(f"  Already saved: {len(saved_urls)} documents\n")
 
     collected = 0
     skipped_short = 0
@@ -222,10 +254,12 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
 
         doc = extract_doc(url, html)
 
+        # Filter 1: minimum text length
         if doc["char_count"] < 500:
             skipped_short += 1
             continue
 
+        # Filter 2: AI keyword relevance (optional)
         if apply_keyword_filter and not keyword_match(doc, AI_KEYWORDS):
             skipped_keyword += 1
             continue
@@ -233,17 +267,17 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
         save_jsonl(doc)
         saved_urls.add(url)
         collected += 1
-        print(f"  ✓ Saved | {doc['char_count']} Sign | {doc['published_time']}")
+        print(f"  ✓ saved | {doc['char_count']} chars | {doc['published_time']}")
 
     print(f"\n=== Done ===")
-    print(f"  Saved:         {collected}")
-    print(f"  Skipped (short): {skipped_short}")
-    print(f"  No Keyword-Match:  {skipped_keyword}")
+    print(f"  Saved:                {collected}")
+    print(f"  Skipped (too short):  {skipped_short}")
+    print(f"  Skipped (no keyword): {skipped_keyword}")
 
 if __name__ == "__main__":
 
-    # Test Run:
+    # Test run:
     # run_scrape(max_docs=10, apply_keyword_filter=False)
 
-    # Full Run:
-     run_scrape(max_docs=1000, apply_keyword_filter=True)
+    # Full run:
+    run_scrape(max_docs=1000, apply_keyword_filter=True)

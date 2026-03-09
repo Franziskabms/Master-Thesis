@@ -56,7 +56,7 @@ SKIP_EXTENSIONS = (
 SKIP_DOMAINS = {"cloudfront.net", "cdn.a16z.com"}
 
 AI_KEYWORDS = [
-    "ai", "artificial intelligence", "llm", "agent", "machine learning",
+    " AI ", "artificial intelligence", " llm ", "agent", "machine learning",
     "foundation model", "generative", "gpt", "deep learning", "automation",
     "model", "intelligence", "software",
 ]

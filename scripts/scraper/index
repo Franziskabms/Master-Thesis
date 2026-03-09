@@ -1,9 +1,11 @@
 import json
+import re
 import time
 import hashlib
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+
 import requests
 from bs4 import BeautifulSoup
 import trafilatura
@@ -13,7 +15,7 @@ import trafilatura
 # -----------------------
 USER_AGENT = "MasterThesisResearchOx/1.0 (contact: franziska.b.m.schaefer@gmail.com)"
 HEADERS = {"User-Agent": USER_AGENT}
-OUT_DIR = Path("indexventures_corpus")
+OUT_DIR = Path.home() / "Documents/Master/Masterarbeit/MA/Code/Scraping/indexventures_corpus"
 CACHE_DIR = OUT_DIR / "cache_html"
 OUT_JSONL = OUT_DIR / "documents.jsonl"
 
@@ -29,10 +31,12 @@ CDX_QUERIES = [
     "http://web.archive.org/cdx/search/cdx?url=www.indexventures.com/perspectives/*&output=json&collapse=urlkey&fl=original&filter=statuscode:200",
 ]
 
+# Word-boundary regex to avoid partial matches like "domain", "against", "wait"
 AI_KEYWORDS = [
-    "ai", "artificial intelligence", "llm", "agent", "machine learning",
-    "foundation model", "generative", "gpt", "deep learning", "automation",
-    "model", "intelligence", "software",
+    r"\bai\b", r"\bartificial intelligence\b", r"\bllm\b", r"\bagent\b",
+    r"\bmachine learning\b", r"\bfoundation model\b", r"\bgenerative\b",
+    r"\bgpt\b", r"\bdeep learning\b", r"\bautomation\b", r"\bintelligence\b",
+    r"\bsoftware\b",
 ]
 
 # -----------------------
@@ -43,6 +47,7 @@ def url_to_cache_path(url: str) -> Path:
     return CACHE_DIR / f"{h}.html"
 
 def fetch_url(url: str, retries: int = 3) -> str | None:
+    """Fetch URL with local HTML cache and retry logic."""
     cache_path = url_to_cache_path(url)
     if cache_path.exists():
         return cache_path.read_text(encoding="utf-8", errors="ignore")
@@ -96,7 +101,7 @@ def collect_urls_from_cdx() -> set[str]:
                     continue
 
                 # Skip non-article subpages
-                if any(x in path for x in ["/relationship/", "/team-member/"]):
+                if any(x in path for x in ["/relationship/", "/team-member/", "/event/", "/video/"]):
                     continue
 
                 # Skip media files
@@ -117,9 +122,28 @@ def collect_urls_from_cdx() -> set[str]:
     return urls
 
 # -----------------------
+# Date extraction
+# -----------------------
+def extract_date_from_body(soup: BeautifulSoup) -> str:
+    """Index Ventures specific: date is stored in body HTML, not in meta tags.
+    Example: <p class='article-detail__published-date'>Published — Nov. 13, 2023</p>
+    """
+    tag = soup.find("p", class_="article-detail__published-date")
+    if tag:
+        text = tag.get_text(strip=True)
+        if "—" in text:
+            return text.split("—")[-1].strip()
+    return ""
+
+# -----------------------
 # Text Extraction
 # -----------------------
 def extract_doc(url: str, html: str) -> dict:
+    """Extracts main text and metadata from HTML.
+    Uses trafilatura as primary extractor with multiple date fallbacks.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
     traf_result = trafilatura.bare_extraction(
         html,
         include_comments=False,
@@ -135,13 +159,11 @@ def extract_doc(url: str, html: str) -> dict:
         tags = traf_result.tags or ""
     else:
         text = trafilatura.extract(html, include_comments=False) or ""
-        soup = BeautifulSoup(html, "html.parser")
         title = soup.title.get_text(strip=True) if soup.title else ""
         date, author, tags = "", "", ""
 
-    # Date fallback via meta tags
+    # Date fallback 1: standard meta tags
     if not date:
-        soup = BeautifulSoup(html, "html.parser")
         for prop in ["article:published_time", "published_time", "og:updated_time"]:
             tag = (soup.find("meta", attrs={"property": prop})
                    or soup.find("meta", attrs={"name": prop}))
@@ -149,11 +171,17 @@ def extract_doc(url: str, html: str) -> dict:
                 date = tag["content"].strip()
                 break
 
+    # Date fallback 2: Index Ventures specific body element
+    # Overrides placeholder dates like 2026-01-01
+    if not date or date.startswith("2026-01-01"):
+        body_date = extract_date_from_body(soup)
+        if body_date:
+            date = body_date
+
     # Subtitle fallback via Open Graph / Twitter meta tags
     if traf_result and hasattr(traf_result, "description") and traf_result.description:
         subtitle = traf_result.description or ""
     else:
-        soup = BeautifulSoup(html, "html.parser")
         subtitle = ""
         for prop in ["og:description", "description", "twitter:description"]:
             tag = (soup.find("meta", attrs={"property": prop})
@@ -179,10 +207,12 @@ def extract_doc(url: str, html: str) -> dict:
 # Storage
 # -----------------------
 def save_jsonl(record: dict):
+    """Appends a single document record to the JSONL output file."""
     with OUT_JSONL.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def load_saved_urls() -> set[str]:
+    """Loads all previously saved URLs for duplicate checking."""
     saved = set()
     if not OUT_JSONL.exists():
         return saved
@@ -195,6 +225,16 @@ def load_saved_urls() -> set[str]:
     return saved
 
 # -----------------------
+# Keyword matching with word boundaries
+# -----------------------
+def keyword_match(doc: dict, keywords: list[str]) -> bool:
+    """Returns True if any keyword matches as a whole word in title or text.
+    Uses regex word boundaries to avoid partial matches like 'domain' for 'ai'.
+    """
+    hay = (doc["title"] + " " + doc["text"]).lower()
+    return any(re.search(pattern, hay) for pattern in keywords)
+
+# -----------------------
 # Main Pipeline
 # -----------------------
 def build_url_list() -> list[str]:
@@ -203,11 +243,8 @@ def build_url_list() -> list[str]:
     print(f"→ {len(all_urls)} URLs total")
     return sorted(all_urls)
 
-def keyword_match(doc: dict, keywords: list[str]) -> bool:
-    hay = (doc["title"] + " " + doc["text"]).lower()
-    return any(k.lower() in hay for k in keywords)
-
-def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
+def run_scrape(max_docs: int = 10000, apply_keyword_filter: bool = True):
+    """Main scraping loop. Resumes automatically if output file already exists."""
     urls = build_url_list()
     print(f"\n=== Scraping: {len(urls)} URLs ===\n")
 
@@ -238,7 +275,7 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
             skipped_short += 1
             continue
 
-        # Filter 2: AI keyword relevance (optional)
+        # Filter 2: AI keyword relevance using word-boundary regex
         if apply_keyword_filter and not keyword_match(doc, AI_KEYWORDS):
             skipped_keyword += 1
             continue
@@ -254,9 +291,7 @@ def run_scrape(max_docs: int = 500, apply_keyword_filter: bool = True):
     print(f"  Skipped (no keyword): {skipped_keyword}")
 
 if __name__ == "__main__":
+    # Delete old documents.jsonl before running to start fresh:
+    # rm ~/Documents/Master/Masterarbeit/MA/Code/Scraping/indexventures_corpus/documents.jsonl
 
-    # Test run:
-    # run_scrape(max_docs=10, apply_keyword_filter=False)
-
-    # Full run:
     run_scrape(max_docs=10000, apply_keyword_filter=True)

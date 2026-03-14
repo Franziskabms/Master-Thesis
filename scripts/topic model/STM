@@ -1,0 +1,260 @@
+# ============================================================
+# Structural Topic Model — VC Corpus, R Studio
+# English only, Sequoia podcasts filtered, K = 25
+# Output: ~/Documents/Master/Masterarbeit/MA/Code/Topic Model/STM/output
+# ============================================================
+options(pkgType = "binary")
+install.packages(c("cld2", "stm", "jsonlite", "tidyverse", "quanteda"))
+
+library(cld2)
+library(stm)
+library(jsonlite)
+library(tidyverse)
+library(quanteda)
+
+# ── 0. Paths ──────────────────────────────────────────────────────────────────
+BASE     <- path.expand("~/Documents/Master/Masterarbeit/MA/Code")
+SCRAPING <- file.path(BASE, "Scraping")
+OUT      <- file.path(BASE, "Topic Model/STM/output")
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+cat("Output directory:", OUT, "\n")
+
+# ── 1. Load corpus ─────────────────────────────────────────────────────────────
+jsonl_files <- list.files(SCRAPING, pattern = "documents.*\\.jsonl$",
+                          recursive = TRUE, full.names = TRUE)
+cat("Found", length(jsonl_files), "JSONL files\n")
+
+docs_raw <- map_dfr(jsonl_files, function(f) {
+  lines <- readLines(f, warn = FALSE)
+  lines <- lines[nzchar(lines)]
+  map_dfr(lines, function(l) {
+    tryCatch(fromJSON(l, flatten = TRUE), error = function(e) NULL)
+  })
+})
+cat("Total documents loaded:", nrow(docs_raw), "\n")
+
+# ── 2. Language filter ─────────────────────────────────────────────────────────
+cat("Detecting languages...\n")
+docs_raw$lang <- detect_language(substr(docs_raw$text, 1, 500))
+
+lang_table <- sort(table(docs_raw$lang, useNA = "always"), decreasing = TRUE)
+cat("\nLanguage distribution:\n")
+print(lang_table)
+
+docs_en <- docs_raw %>% filter(lang == "en")
+cat("\nAfter English filter:", nrow(docs_en), "documents\n")
+cat("Removed:", nrow(docs_raw) - nrow(docs_en), "non-English documents\n")
+
+# ── 3. Podcast filter (Sequoia transcripts) ────────────────────────────────────
+# Identify Sequoia podcast transcripts by transcript markers in text
+podcast_markers <- " uh | yeah | [Laughter]|\\[laughs\\]|\\[laugh\\]"
+
+docs_en <- docs_en %>%
+  mutate(
+    is_podcast = fund == "Sequoia Capital" &
+      str_detect(text, regex(podcast_markers, ignore_case = TRUE))
+  )
+
+cat("\nSequoia podcast transcripts detected:", sum(docs_en$is_podcast), "\n")
+cat("Sequoia total:", sum(docs_en$fund == "Sequoia Capital"), "\n")
+
+# Save log
+write_csv(
+  docs_en %>% select(fund, url, published_time, lang, is_podcast),
+  file.path(OUT, "filter_log.csv")
+)
+
+docs_en <- docs_en %>% filter(!is_podcast)
+cat("Documents after podcast filter:", nrow(docs_en), "\n")
+
+# ── 4. Metadata & covariates ───────────────────────────────────────────────────
+ai_specialist_funds <- c("Radical Ventures", "DCVC", "AI Fund")
+eu_funds            <- c("Balderton Capital", "Atomico", "Index Ventures", "Speedinvest")
+
+docs <- docs_en %>%
+  mutate(
+    year         = as.integer(substr(published_time, 1, 4)),
+    year         = ifelse(year >= 2007 & year <= 2026, year, NA),
+    fund_type    = ifelse(fund %in% ai_specialist_funds, "AI-specialist", "Generalist"),
+    geography    = ifelse(fund %in% eu_funds, "EU", "US"),
+    post_chatgpt = ifelse(!is.na(year) & year >= 2023, 1L, 0L),
+    year_c       = year - 2019
+  ) %>%
+  filter(!is.na(year), nchar(text) > 50)
+
+cat("\nFinal corpus size:", nrow(docs), "\n")
+cat("\nFund types:\n");    print(table(docs$fund_type))
+cat("\nGeography:\n");     print(table(docs$geography))
+cat("\nPost-ChatGPT:\n");  print(table(docs$post_chatgpt))
+cat("\nDocs per fund:\n"); print(sort(table(docs$fund), decreasing = TRUE))
+
+# ── 5. Text preprocessing ──────────────────────────────────────────────────────
+corp <- corpus(docs, text_field = "text",
+               docvars = docs[, c("fund", "fund_type", "geography",
+                                  "year", "year_c", "post_chatgpt")])
+
+toks <- corp %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en")) %>%
+  tokens_remove(c("also", "can", "will", "one", "get", "make", "new",
+                  "use", "used", "using", "like", "just", "way", "well",
+                  "may", "even", "many", "much", "need", "want", "see",
+                  "think", "know", "said", "say", "go", "going", "come",
+                  "take", "gives", "given", "across", "around", "within",
+                  "without", "whether", "every", "already", "still",
+                  # remove podcast/speech markers
+                  "yeah", "realli", "thing", "lot", "actual",
+                  "right", "okay", "got", "talk", "uh")) %>%
+  tokens_wordstem()
+
+dfm_full <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 10, min_docfreq = 5)
+
+cat("\nDFM dimensions:", dim(dfm_full), "\n")
+stm_input <- convert(dfm_full, to = "stm")
+
+# ── 6. Fit final model with K = 25 ─────────────────────────────────────────────
+# K selected based on k_search diagnostics:
+# - Held-out likelihood and residuals improve up to K=30
+# - Semantic coherence flattens after K=20
+# - K=25 balances coherence and granularity
+K_FINAL <- 25
+
+cat("\nFitting STM with K =", K_FINAL, "...\n")
+
+stm_model <- stm(
+  documents  = stm_input$documents,
+  vocab      = stm_input$vocab,
+  K          = K_FINAL,
+  prevalence = ~ fund_type + geography + year_c + post_chatgpt,
+  data       = stm_input$meta,
+  init.type  = "Spectral",
+  verbose    = TRUE
+)
+
+saveRDS(stm_model, file.path(OUT, paste0("stm_K", K_FINAL, ".rds")))
+cat("Model saved.\n")
+
+# ── 7. Inspect topics ──────────────────────────────────────────────────────────
+cat("\n--- TOP WORDS PER TOPIC (FREX) ---\n")
+frex_words <- labelTopics(stm_model, n = 10)
+print(frex_words)
+
+top_words_df <- as.data.frame(frex_words$frex)
+colnames(top_words_df) <- paste0("word_", 1:10)
+top_words_df$topic <- paste0("Topic_", 1:K_FINAL)
+write.csv(top_words_df,
+          file.path(OUT, paste0("top_words_K", K_FINAL, ".csv")),
+          row.names = FALSE)
+
+# ── 8. Topic proportions ───────────────────────────────────────────────────────
+topic_props <- colMeans(stm_model$theta)
+names(topic_props) <- paste0("Topic_", 1:K_FINAL)
+cat("\nMean topic proportions:\n")
+print(round(sort(topic_props, decreasing = TRUE), 3))
+
+props_df <- data.frame(
+  topic      = names(topic_props),
+  proportion = as.numeric(topic_props)
+) %>% arrange(desc(proportion))
+write.csv(props_df,
+          file.path(OUT, paste0("topic_proportions_K", K_FINAL, ".csv")),
+          row.names = FALSE)
+
+# ── 9. Covariate effects ───────────────────────────────────────────────────────
+cat("\nEstimating covariate effects...\n")
+
+effects <- estimateEffect(
+  formula     = 1:K_FINAL ~ fund_type + geography + year_c + post_chatgpt,
+  stmobj      = stm_model,
+  metadata    = stm_input$meta,
+  uncertainty = "Global"
+)
+
+saveRDS(effects, file.path(OUT, paste0("effects_K", K_FINAL, ".rds")))
+
+# Fund type effect
+pdf(file.path(OUT, paste0("effects_fund_type_K", K_FINAL, ".pdf")),
+    width = 10, height = 14)
+plot(effects, covariate = "fund_type",
+     topics = 1:K_FINAL, model = stm_model,
+     method = "difference",
+     cov.value1 = "AI-specialist", cov.value2 = "Generalist",
+     xlab = "Effect (AI-specialist vs. Generalist)",
+     main = "Fund Type Effect on Topic Prevalence",
+     labeltype = "frex")
+dev.off()
+
+# Post-ChatGPT effect
+pdf(file.path(OUT, paste0("effects_post_chatgpt_K", K_FINAL, ".pdf")),
+    width = 10, height = 14)
+plot(effects, covariate = "post_chatgpt",
+     topics = 1:K_FINAL, model = stm_model,
+     method = "difference",
+     cov.value1 = 1, cov.value2 = 0,
+     xlab = "Effect (post vs. pre ChatGPT)",
+     main = "Post-ChatGPT Effect on Topic Prevalence",
+     labeltype = "frex")
+dev.off()
+
+# Year trend — top 6 topics
+top6 <- order(topic_props, decreasing = TRUE)[1:6]
+pdf(file.path(OUT, paste0("effects_year_top6_K", K_FINAL, ".pdf")),
+    width = 12, height = 7)
+plot(effects, covariate = "year_c",
+     topics = top6, model = stm_model,
+     method = "continuous",
+     xlab = "Year (centered at 2019)",
+     main = "Topic Trends Over Time (Top 6 Topics)")
+dev.off()
+
+# Geography effect
+pdf(file.path(OUT, paste0("effects_geography_K", K_FINAL, ".pdf")),
+    width = 10, height = 14)
+plot(effects, covariate = "geography",
+     topics = 1:K_FINAL, model = stm_model,
+     method = "difference",
+     cov.value1 = "EU", cov.value2 = "US",
+     xlab = "Effect (EU vs. US)",
+     main = "Geography Effect on Topic Prevalence",
+     labeltype = "frex")
+dev.off()
+
+# ── 10. Stability check ────────────────────────────────────────────────────────
+cat("\nRunning stability check (3 additional seeds)...\n")
+
+stability_models <- lapply(1:3, function(seed) {
+  set.seed(seed * 42)
+  stm(
+    documents  = stm_input$documents,
+    vocab      = stm_input$vocab,
+    K          = K_FINAL,
+    prevalence = ~ fund_type + geography + year_c + post_chatgpt,
+    data       = stm_input$meta,
+    init.type  = "Spectral",
+    verbose    = FALSE
+  )
+})
+
+saveRDS(stability_models,
+        file.path(OUT, paste0("stability_K", K_FINAL, ".rds")))
+cat("Stability models saved.\n")
+
+# ── 11. Done ───────────────────────────────────────────────────────────────────
+cat("\n============================================================\n")
+cat("STM COMPLETE\n")
+cat("============================================================\n")
+cat("K =", K_FINAL, "| Corpus:", nrow(docs), "documents\n")
+cat("Output:", OUT, "\n")
+cat("\nFiles saved:\n")
+cat(paste0("  stm_K", K_FINAL, ".rds\n"))
+cat(paste0("  top_words_K", K_FINAL, ".csv\n"))
+cat(paste0("  topic_proportions_K", K_FINAL, ".csv\n"))
+cat(paste0("  effects_K", K_FINAL, ".rds\n"))
+cat(paste0("  effects_fund_type_K", K_FINAL, ".pdf\n"))
+cat(paste0("  effects_post_chatgpt_K", K_FINAL, ".pdf\n"))
+cat(paste0("  effects_year_top6_K", K_FINAL, ".pdf\n"))
+cat(paste0("  effects_geography_K", K_FINAL, ".pdf\n"))
+cat(paste0("  stability_K", K_FINAL, ".rds\n"))
+cat("  filter_log.csv\n")

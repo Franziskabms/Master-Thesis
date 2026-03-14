@@ -1,0 +1,201 @@
+# ============================================================
+# STM Effect Plots — VC Corpus, K=25
+# ============================================================
+# Requires: stm, tidyverse (install if needed)
+# Input:    stm_K25.rds, effects_K25.rds (from stm_final.R)
+# Output:   4 PDF plots in Topic Model/STM/output/
+
+library(stm)
+library(tidyverse)
+
+# ── 0. Paths ──────────────────────────────────────────────────────────────────
+BASE <- path.expand("~/Documents/Master/Masterarbeit/MA/Code")
+OUT  <- file.path(BASE, "Topic Model/STM/output")
+
+# ── 1. Load model ─────────────────────────────────────────────────────────────
+cat("Loading model...\n")
+stm_model <- readRDS(file.path(OUT, "stm_K25.rds"))
+effects   <- readRDS(file.path(OUT, "effects_K25.rds"))
+
+# ── 2. Re-estimate effects (needed for year trend plot) ───────────────────────
+cat("Estimating effects...\n")
+effects_full <- estimateEffect(
+  formula     = 1:25 ~ fund_type + geography + year_c + post_chatgpt,
+  stmobj      = stm_model,
+  metadata    = effects$data,
+  uncertainty = "Global"
+)
+
+# ── 3. Topic labels ───────────────────────────────────────────────────────────
+topic_labels <- c(
+  "T1: a16z Media",
+  "T2: Marketplace & B2B",
+  "T3: Defense & Space",
+  "T4: Crypto & Web3",
+  "T5: Founder Stories",
+  "T6: Bio & Deep Tech (DCVC)",
+  "T7: Climate & Robotics",
+  "T8: AI Regulation & Policy",
+  "T9: Fintech & Banking",
+  "T10: SaaS Metrics",
+  "T11: Informal/Conversational",
+  "T12: Cloud & India SaaS",
+  "T13: Fund Announcements",
+  "T14: Generative AI & LLMs",
+  "T15: Hiring & Talent",
+  "T16: AI Research (Radical)",
+  "T17: Investment/Legal",
+  "T18: European VC",
+  "T19: Education & Space",
+  "T20: Sales & GTM",
+  "T21: Healthcare",
+  "T22: Retail & Consumer",
+  "T23: Consumer Apps & Video",
+  "T24: Cybersecurity",
+  "T25: Data Infrastructure"
+)
+
+K <- 25
+
+# ── 4. Helper: extract covariate effects ──────────────────────────────────────
+extract_effects <- function(effects, pattern, K, labels) {
+  map_dfr(1:K, function(k) {
+    s  <- summary(effects, topics = k)$tables[[1]]
+    rn <- rownames(s)
+    m  <- rn[grepl(pattern, rn, fixed = FALSE)]
+    if (length(m) == 0) return(NULL)
+    data.frame(
+      topic     = labels[k],
+      estimate  = s[m[1], "Estimate"],
+      se        = s[m[1], "Std. Error"],
+      topic_num = k,
+      stringsAsFactors = FALSE
+    )
+  }) %>%
+    mutate(
+      lo    = estimate - 1.96 * se,
+      hi    = estimate + 1.96 * se,
+      sig   = (lo > 0 | hi < 0),
+      topic = factor(topic, levels = rev(labels))
+    )
+}
+
+# ── 5. Helper: dot-and-whisker plot ───────────────────────────────────────────
+plot_effects <- function(df, title, xlab, filename) {
+  p <- ggplot(df, aes(x = estimate, y = topic, color = sig)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.3, linewidth = 0.5) +
+    geom_point(size = 2.5) +
+    scale_color_manual(
+      values = c("TRUE"  = "#C0392B", "FALSE" = "#7F8C8D"),
+      labels = c("TRUE"  = "Significant (95% CI)",
+                 "FALSE" = "Not significant"),
+      name   = ""
+    ) +
+    labs(title = title, x = xlab, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid.major.y = element_line(color = "grey92"),
+      panel.grid.minor   = element_blank(),
+      legend.position    = "bottom",
+      plot.title         = element_text(face = "bold", size = 13),
+      axis.text.y        = element_text(size = 9)
+    )
+  path <- file.path(OUT, filename)
+  ggsave(path, p, width = 10, height = 9, dpi = 150)
+  cat("Saved:", path, "\n")
+}
+
+# ── 6. Plot 1: Fund type (AI-specialist vs. Generalist) ───────────────────────
+cat("\nPlot 1: Fund type effect...\n")
+df_fund <- extract_effects(effects_full, "fund_typeGeneralist", K, topic_labels)
+plot_effects(
+  df_fund,
+  title    = "Fund Type Effect on Topic Prevalence",
+  xlab     = "Effect (Generalist vs. AI-specialist)",
+  filename = "plot_fund_type_K25.pdf"
+)
+
+# ── 7. Plot 2: Post-ChatGPT ───────────────────────────────────────────────────
+cat("Plot 2: Post-ChatGPT effect...\n")
+df_chatgpt <- extract_effects(effects_full, "post_chatgpt", K, topic_labels)
+plot_effects(
+  df_chatgpt,
+  title    = "Post-ChatGPT Effect on Topic Prevalence",
+  xlab     = "Effect (post vs. pre ChatGPT, Nov 2022)",
+  filename = "plot_post_chatgpt_K25.pdf"
+)
+
+# ── 8. Plot 3: Geography (US vs. EU) ─────────────────────────────────────────
+cat("Plot 3: Geography effect...\n")
+df_geo <- extract_effects(effects_full, "geographyUS", K, topic_labels)
+plot_effects(
+  df_geo,
+  title    = "Geography Effect on Topic Prevalence",
+  xlab     = "Effect (US vs. EU funds)",
+  filename = "plot_geography_K25.pdf"
+)
+
+# ── 9. Plot 4: Year trends for AI-related topics ──────────────────────────────
+cat("Plot 4: Year trends...\n")
+
+ai_topics <- c(8, 14, 16)   # AI Regulation, Generative AI, AI Research
+colors    <- c("#E74C3C", "#2980B9", "#27AE60")
+
+year_df <- map_dfr(seq_along(ai_topics), function(i) {
+  k  <- ai_topics[i]
+  pl <- plot(effects_full,
+             covariate    = "year_c",
+             topics       = k,
+             method       = "continuous",
+             npoints      = 100,
+             printlegend  = FALSE,
+             plot         = FALSE)
+  data.frame(
+    year     = pl$x + 2019,
+    estimate = pl$means[[1]],
+    lo       = pl$ci[[1]][1, ],
+    hi       = pl$ci[[1]][2, ],
+    topic    = topic_labels[k]
+  )
+})
+
+p_year <- ggplot(year_df,
+                 aes(x = year, y = estimate,
+                     color = topic, fill = topic)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = 2022.9, linetype = "dashed", color = "grey40") +
+  annotate("text", x = 2023.1, y = max(year_df$hi) * 0.9,
+           label = "ChatGPT\nlaunch", hjust = 0,
+           size = 3, color = "grey40") +
+  scale_color_manual(values = setNames(colors, topic_labels[ai_topics])) +
+  scale_fill_manual(values  = setNames(colors, topic_labels[ai_topics])) +
+  scale_x_continuous(breaks = seq(2008, 2026, by = 2)) +
+  labs(
+    title = "AI-Related Topic Trends Over Time",
+    x     = "Year",
+    y     = "Expected Topic Proportion",
+    color = NULL,
+    fill  = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "bottom",
+    plot.title       = element_text(face = "bold", size = 13),
+    panel.grid.minor = element_blank()
+  )
+
+path_year <- file.path(OUT, "plot_year_ai_K25.pdf")
+ggsave(path_year, p_year, width = 10, height = 5, dpi = 150)
+cat("Saved:", path_year, "\n")
+
+# ── 10. Done ──────────────────────────────────────────────────────────────────
+cat("\n============================================================\n")
+cat("All plots saved to:", OUT, "\n")
+cat("Files:\n")
+cat("  plot_fund_type_K25.pdf\n")
+cat("  plot_post_chatgpt_K25.pdf\n")
+cat("  plot_geography_K25.pdf\n")
+cat("  plot_year_ai_K25.pdf\n")
+cat("============================================================\n")

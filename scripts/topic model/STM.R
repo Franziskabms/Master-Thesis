@@ -1,235 +1,275 @@
 # ============================================================
-# STM Effect Plots — VC Corpus, K=25
+# Structural Topic Model — VC Corpus
+# English only, Sequoia podcasts filtered, K = 25
+# Output: ~/Documents/Master/Masterarbeit/MA/Code/Topic Model/STM/output
 # ============================================================
+options(pkgType = "binary")
+install.packages(c("cld2", "stm", "jsonlite", "tidyverse", "quanteda", "huge"))
+library(cld2)
 library(stm)
+library(jsonlite)
 library(tidyverse)
-library(igraph)
-library(ggraph)
-library(tidygraph)
-library(ggrepel)
+library(quanteda)
 
 # ── 0. Paths ──────────────────────────────────────────────────────────────────
-BASE <- path.expand("~/Documents/Master/Masterarbeit/MA/Code")
-OUT  <- file.path(BASE, "Topic Model/STM/output")
+BASE     <- path.expand("~/Documents/Master/Masterarbeit/MA/Code")
+SCRAPING <- file.path(BASE, "Scraping")
+OUT      <- file.path(BASE, "Topic Model/STM/output")
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+cat("Output directory:", OUT, "\n")
 
-# ── 1. Load model ─────────────────────────────────────────────────────────────
-cat("Loading model...\n")
-stm_model <- readRDS(file.path(OUT, "stm_K25.rds"))
-effects   <- readRDS(file.path(OUT, "effects_K25.rds"))
-corr      <- readRDS(file.path(OUT, "topic_corr_K25.rds"))
+# ── 1. Load corpus ─────────────────────────────────────────────────────────────
+jsonl_files <- list.files(SCRAPING, pattern = "documents.*\\.jsonl$",
+                          recursive = TRUE, full.names = TRUE)
+cat("Found", length(jsonl_files), "JSONL files\n")
 
-# ── 2. Re-estimate effects ────────────────────────────────────────────────────
-cat("Estimating effects...\n")
-effects_full <- estimateEffect(
-  formula     = 1:25 ~ fund_type + geography + year_c + post_chatgpt,
+docs_raw <- map_dfr(jsonl_files, function(f) {
+  lines <- readLines(f, warn = FALSE)
+  lines <- lines[nzchar(lines)]
+  map_dfr(lines, function(l) {
+    tryCatch(fromJSON(l, flatten = TRUE), error = function(e) NULL)
+  })
+})
+cat("Total documents loaded:", nrow(docs_raw), "\n")
+
+# ── 2. Language filter ─────────────────────────────────────────────────────────
+cat("Detecting languages...\n")
+docs_raw$lang <- detect_language(substr(docs_raw$text, 1, 500))
+
+lang_table <- sort(table(docs_raw$lang, useNA = "always"), decreasing = TRUE)
+cat("\nLanguage distribution:\n")
+print(lang_table)
+
+docs_en <- docs_raw %>% filter(lang == "en")
+cat("\nAfter English filter:", nrow(docs_en), "documents\n")
+cat("Removed:", nrow(docs_raw) - nrow(docs_en), "non-English documents\n")
+
+# ── 3. Podcast filter (Sequoia transcripts) ────────────────────────────────────
+# Identify Sequoia podcast transcripts by transcript markers in text
+podcast_markers <- " uh | yeah | [Laughter]|\\[laughs\\]|\\[laugh\\]"
+
+docs_en <- docs_en %>%
+  mutate(
+    is_podcast = fund == "Sequoia Capital" &
+      str_detect(text, regex(podcast_markers, ignore_case = TRUE))
+  )
+
+cat("\nSequoia podcast transcripts detected:", sum(docs_en$is_podcast), "\n")
+cat("Sequoia total:", sum(docs_en$fund == "Sequoia Capital"), "\n")
+
+# Save log
+write_csv(
+  docs_en %>% select(fund, url, published_time, lang, is_podcast),
+  file.path(OUT, "filter_log.csv")
+)
+
+docs_en <- docs_en %>% filter(!is_podcast)
+cat("Documents after podcast filter:", nrow(docs_en), "\n")
+
+# ── 4. Metadata & covariates ───────────────────────────────────────────────────
+ai_specialist_funds <- c("Radical Ventures", "DCVC", "AI Fund")
+eu_funds            <- c("Balderton Capital", "Atomico", "Index Ventures", "Speedinvest")
+
+docs <- docs_en %>%
+  mutate(
+    year         = as.integer(substr(published_time, 1, 4)),
+    year         = ifelse(year >= 2007 & year <= 2026, year, NA),
+    fund_type    = ifelse(fund %in% ai_specialist_funds, "AI-specialist", "Generalist"),
+    geography    = ifelse(fund %in% eu_funds, "EU", "US"),
+    post_chatgpt = ifelse(!is.na(year) & year >= 2023, 1L, 0L),
+    year_c       = year - 2019
+  ) %>%
+  filter(!is.na(year), nchar(text) > 50)
+
+cat("\nFinal corpus size:", nrow(docs), "\n")
+cat("\nFund types:\n");    print(table(docs$fund_type))
+cat("\nGeography:\n");     print(table(docs$geography))
+cat("\nPost-ChatGPT:\n");  print(table(docs$post_chatgpt))
+cat("\nDocs per fund:\n"); print(sort(table(docs$fund), decreasing = TRUE))
+
+# ── 5. Text preprocessing ──────────────────────────────────────────────────────
+corp <- corpus(docs, text_field = "text",
+               docvars = docs[, c("fund", "fund_type", "geography",
+                                  "year", "year_c", "post_chatgpt")])
+
+toks <- corp %>%
+  tokens(remove_punct = TRUE, remove_numbers = TRUE, remove_symbols = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en")) %>%
+  tokens_remove(c("also", "can", "will", "one", "get", "make", "new",
+                  "use", "used", "using", "like", "just", "way", "well",
+                  "may", "even", "many", "much", "need", "want", "see",
+                  "think", "know", "said", "say", "go", "going", "come",
+                  "take", "gives", "given", "across", "around", "within",
+                  "without", "whether", "every", "already", "still",
+                  # remove podcast/speech markers
+                  "yeah", "realli", "thing", "lot", "actual",
+                  "right", "okay", "got", "talk", "uh")) %>%
+  tokens_wordstem()
+
+dfm_full <- dfm(toks) %>%
+  dfm_trim(min_termfreq = 10, min_docfreq = 5)
+
+cat("\nDFM dimensions:", dim(dfm_full), "\n")
+stm_input <- convert(dfm_full, to = "stm")
+
+# ── 6. Fit final model with K = 25 ─────────────────────────────────────────────
+# K selected based on k_search diagnostics:
+# - Held-out likelihood and residuals improve up to K=30
+# - Semantic coherence flattens after K=20
+# - K=25 balances coherence and granularity
+K_FINAL <- 25
+
+cat("\nFitting STM with K =", K_FINAL, "...\n")
+
+stm_model <- stm(
+  documents  = stm_input$documents,
+  vocab      = stm_input$vocab,
+  K          = K_FINAL,
+  prevalence = ~ fund_type + geography + year_c + post_chatgpt,
+  data       = stm_input$meta,
+  init.type  = "Spectral",
+  verbose    = TRUE
+)
+
+saveRDS(stm_model, file.path(OUT, paste0("stm_K", K_FINAL, ".rds")))
+cat("Model saved.\n")
+
+# ── 7. Inspect topics ──────────────────────────────────────────────────────────
+cat("\n--- TOP WORDS PER TOPIC (FREX) ---\n")
+frex_words <- labelTopics(stm_model, n = 10)
+print(frex_words)
+
+top_words_df <- as.data.frame(frex_words$frex)
+colnames(top_words_df) <- paste0("word_", 1:10)
+top_words_df$topic <- paste0("Topic_", 1:K_FINAL)
+write.csv(top_words_df,
+          file.path(OUT, paste0("top_words_K", K_FINAL, ".csv")),
+          row.names = FALSE)
+
+# ── 8. Topic proportions ───────────────────────────────────────────────────────
+topic_props <- colMeans(stm_model$theta)
+names(topic_props) <- paste0("Topic_", 1:K_FINAL)
+cat("\nMean topic proportions:\n")
+print(round(sort(topic_props, decreasing = TRUE), 3))
+
+props_df <- data.frame(
+  topic      = names(topic_props),
+  proportion = as.numeric(topic_props)
+) %>% arrange(desc(proportion))
+write.csv(props_df,
+          file.path(OUT, paste0("topic_proportions_K", K_FINAL, ".csv")),
+          row.names = FALSE)
+
+# ── 9. Covariate effects ───────────────────────────────────────────────────────
+cat("\nEstimating covariate effects...\n")
+
+effects <- estimateEffect(
+  formula     = 1:K_FINAL ~ fund_type + geography + year_c + post_chatgpt,
   stmobj      = stm_model,
-  metadata    = effects$data,
+  metadata    = stm_input$meta,
   uncertainty = "Global"
 )
 
-# ── 3. Topic labels ───────────────────────────────────────────────────────────
-topic_labels <- c(
-  "T1: a16z Media", "T2: Marketplace & B2B", "T3: Defense & Space",
-  "T4: Crypto & Web3", "T5: Founder Stories", "T6: Bio & Deep Tech (DCVC)",
-  "T7: Climate & Robotics", "T8: AI Regulation & Policy", "T9: Fintech & Banking",
-  "T10: SaaS Metrics", "T11: Informal/Conversational", "T12: Cloud & India SaaS",
-  "T13: Fund Announcements", "T14: Generative AI & LLMs", "T15: Hiring & Talent",
-  "T16: AI Research (Radical)", "T17: Investment/Legal", "T18: European VC",
-  "T19: Education & Space", "T20: Sales & GTM", "T21: Healthcare",
-  "T22: Retail & Consumer", "T23: Consumer Apps & Video", "T24: Cybersecurity",
-  "T25: Data Infrastructure"
-)
+saveRDS(effects, file.path(OUT, paste0("effects_K", K_FINAL, ".rds")))
 
-topic_labels_short <- c(
-  "a16z Media", "Marketplace & B2B", "Defense & Space",
-  "Crypto & Web3", "Founder Stories", "Bio & Deep Tech",
-  "Climate & Robotics", "AI Regulation", "Fintech",
-  "SaaS Metrics", "Informal", "Cloud & India SaaS",
-  "Fund Announcements", "Generative AI & LLMs", "Hiring & Talent",
-  "AI Research", "Investment/Legal", "European VC",
-  "Education & Space", "Sales & GTM", "Healthcare",
-  "Retail & Consumer", "Consumer Apps", "Cybersecurity",
-  "Data Infrastructure"
-)
+# Fund type effect
+pdf(file.path(OUT, paste0("effects_fund_type_K", K_FINAL, ".pdf")),
+    width = 10, height = 14)
+plot(effects, covariate = "fund_type",
+     topics = 1:K_FINAL, model = stm_model,
+     method = "difference",
+     cov.value1 = "AI-specialist", cov.value2 = "Generalist",
+     xlab = "Effect (AI-specialist vs. Generalist)",
+     main = "Fund Type Effect on Topic Prevalence",
+     labeltype = "frex")
+dev.off()
 
-K <- 25
+# Post-ChatGPT effect
+pdf(file.path(OUT, paste0("effects_post_chatgpt_K", K_FINAL, ".pdf")),
+    width = 10, height = 14)
+plot(effects, covariate = "post_chatgpt",
+     topics = 1:K_FINAL, model = stm_model,
+     method = "difference",
+     cov.value1 = 1, cov.value2 = 0,
+     xlab = "Effect (post vs. pre ChatGPT)",
+     main = "Post-ChatGPT Effect on Topic Prevalence",
+     labeltype = "frex")
+dev.off()
 
-# ── 4. Helper: extract covariate effects ──────────────────────────────────────
-extract_effects <- function(effects, pattern, K, labels) {
-  map_dfr(1:K, function(k) {
-    s  <- summary(effects, topics = k)$tables[[1]]
-    rn <- rownames(s)
-    m  <- rn[grepl(pattern, rn, fixed = FALSE)]
-    if (length(m) == 0) return(NULL)
-    data.frame(
-      topic     = labels[k],
-      estimate  = s[m[1], "Estimate"],
-      se        = s[m[1], "Std. Error"],
-      topic_num = k,
-      stringsAsFactors = FALSE
-    )
-  }) %>%
-    mutate(
-      lo    = estimate - 1.96 * se,
-      hi    = estimate + 1.96 * se,
-      sig   = (lo > 0 | hi < 0),
-      topic = factor(topic, levels = rev(labels))
-    )
-}
+# Year trend — top 6 topics
+top6 <- order(topic_props, decreasing = TRUE)[1:6]
+pdf(file.path(OUT, paste0("effects_year_top6_K", K_FINAL, ".pdf")),
+    width = 12, height = 7)
+plot(effects, covariate = "year_c",
+     topics = top6, model = stm_model,
+     method = "continuous",
+     xlab = "Year (centered at 2019)",
+     main = "Topic Trends Over Time (Top 6 Topics)")
+dev.off()
 
-# ── 5. Helper: dot-and-whisker plot ───────────────────────────────────────────
-plot_effects <- function(df, title, xlab, filename) {
-  p <- ggplot(df, aes(x = estimate, y = topic, color = sig)) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
-    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.3, linewidth = 0.5) +
-    geom_point(size = 2.5) +
-    scale_color_manual(
-      values = c("TRUE" = "#C0392B", "FALSE" = "#7F8C8D"),
-      labels = c("TRUE" = "Significant (95% CI)", "FALSE" = "Not significant"),
-      name   = ""
-    ) +
-    labs(title = title, x = xlab, y = NULL) +
-    theme_minimal(base_size = 11) +
-    theme(
-      panel.grid.major.y = element_line(color = "grey92"),
-      panel.grid.minor   = element_blank(),
-      legend.position    = "bottom",
-      plot.title         = element_text(face = "bold", size = 13),
-      axis.text.y        = element_text(size = 9)
-    )
-  path <- file.path(OUT, filename)
-  ggsave(path, p, width = 10, height = 9, dpi = 150)
-  cat("Saved:", path, "\n")
-}
+# Geography effect
+pdf(file.path(OUT, paste0("effects_geography_K", K_FINAL, ".pdf")),
+    width = 10, height = 14)
+plot(effects, covariate = "geography",
+     topics = 1:K_FINAL, model = stm_model,
+     method = "difference",
+     cov.value1 = "EU", cov.value2 = "US",
+     xlab = "Effect (EU vs. US)",
+     main = "Geography Effect on Topic Prevalence",
+     labeltype = "frex")
+dev.off()
 
-# ── 6. Plot 1: Fund type ──────────────────────────────────────────────────────
-cat("\nPlot 1: Fund type effect...\n")
-df_fund <- extract_effects(effects_full, "fund_typeGeneralist", K, topic_labels)
-plot_effects(df_fund,
-  title    = "Fund Type Effect on Topic Prevalence",
-  xlab     = "Effect (Generalist vs. AI-specialist)",
-  filename = "plot_fund_type_K25.pdf")
+# ── 10. Stability check ────────────────────────────────────────────────────────
+cat("\nRunning stability check (3 additional seeds)...\n")
 
-# ── 7. Plot 2: Post-ChatGPT ───────────────────────────────────────────────────
-cat("Plot 2: Post-ChatGPT effect...\n")
-df_chatgpt <- extract_effects(effects_full, "post_chatgpt", K, topic_labels)
-plot_effects(df_chatgpt,
-  title    = "Post-ChatGPT Effect on Topic Prevalence",
-  xlab     = "Effect (post vs. pre ChatGPT, Nov 2022)",
-  filename = "plot_post_chatgpt_K25.pdf")
-
-# ── 8. Plot 3: Geography ─────────────────────────────────────────────────────
-cat("Plot 3: Geography effect...\n")
-df_geo <- extract_effects(effects_full, "geographyUS", K, topic_labels)
-plot_effects(df_geo,
-  title    = "Geography Effect on Topic Prevalence",
-  xlab     = "Effect (US vs. EU funds)",
-  filename = "plot_geography_K25.pdf")
-
-# ── 9. Plot 4: Year trends ────────────────────────────────────────────────────
-cat("Plot 4: Year trends...\n")
-ai_topics <- c(8, 14, 16)
-colors    <- c("#E74C3C", "#2980B9", "#27AE60")
-
-year_df <- map_dfr(seq_along(ai_topics), function(i) {
-  k  <- ai_topics[i]
-  pl <- plot(effects_full, covariate = "year_c", topics = k,
-             method = "continuous", npoints = 100,
-             printlegend = FALSE, plot = FALSE)
-  data.frame(
-    year     = pl$x + 2019,
-    estimate = pl$means[[1]],
-    lo       = pl$ci[[1]][1, ],
-    hi       = pl$ci[[1]][2, ],
-    topic    = topic_labels[k]
+stability_models <- lapply(1:3, function(seed) {
+  set.seed(seed * 42)
+  stm(
+    documents  = stm_input$documents,
+    vocab      = stm_input$vocab,
+    K          = K_FINAL,
+    prevalence = ~ fund_type + geography + year_c + post_chatgpt,
+    data       = stm_input$meta,
+    init.type  = "Spectral",
+    verbose    = FALSE
   )
 })
 
-p_year <- ggplot(year_df, aes(x = year, y = estimate, color = topic, fill = topic)) +
-  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
-  geom_line(linewidth = 1) +
-  geom_vline(xintercept = 2022.9, linetype = "dashed", color = "grey40") +
-  annotate("text", x = 2023.1, y = max(year_df$hi) * 0.9,
-           label = "ChatGPT\nlaunch", hjust = 0, size = 3, color = "grey40") +
-  scale_color_manual(values = setNames(colors, topic_labels[ai_topics])) +
-  scale_fill_manual(values  = setNames(colors, topic_labels[ai_topics])) +
-  scale_x_continuous(breaks = seq(2008, 2026, by = 2)) +
-  labs(title = "AI-Related Topic Trends Over Time", x = "Year",
-       y = "Expected Topic Proportion", color = NULL, fill = NULL) +
-  theme_minimal(base_size = 11) +
-  theme(legend.position = "bottom",
-        plot.title = element_text(face = "bold", size = 13),
-        panel.grid.minor = element_blank())
+saveRDS(stability_models,
+        file.path(OUT, paste0("stability_K", K_FINAL, ".rds")))
+cat("Stability models saved.\n")
 
-ggsave(file.path(OUT, "plot_year_ai_K25.pdf"), p_year, width = 10, height = 5, dpi = 150)
-cat("Saved: plot_year_ai_K25.pdf\n")
+# ── 10.5 Topic correlations ───────────────────────────────────────────────────
+cat("\nCalculating topic correlations...\n")
 
-# ── 10. Plot 5: Topic correlation network ─────────────────────────────────────
-cat("Plot 5: Topic correlation network...\n")
+corr <- topicCorr(stm_model, method = "huge", cutoff = 0.01)
 
-cluster <- c(
-  "Artefakt", "Markt & Produkt", "Gesellschaft & Tech", "Peripher",
-  "Markt & Produkt", "Gesellschaft & Tech", "Gesellschaft & Tech",
-  "Gesellschaft & Tech", "Peripher", "Markt & Produkt", "Markt & Produkt",
-  "Markt & Produkt", "European VC", "Markt & Produkt", "Markt & Produkt",
-  "Gesellschaft & Tech", "Peripher", "European VC", "Gesellschaft & Tech",
-  "Markt & Produkt", "Gesellschaft & Tech", "European VC", "Markt & Produkt",
-  "Markt & Produkt", "Markt & Produkt"
-)
+pdf(file.path(OUT, paste0("topic_correlations_K", K_FINAL, ".pdf")),
+    width = 12, height = 12)
+plot(corr,
+     topics = 1:K_FINAL,
+     vlabels = paste0("T", 1:K_FINAL),
+     main = "Topic Correlation Network")
+dev.off()
 
-props <- colMeans(stm_model$theta)
-adj   <- corr$posadj
-diag(adj) <- 0
-g <- graph_from_adjacency_matrix(adj, mode = "undirected",
-                                 weighted = TRUE, diag = FALSE)
-V(g)$label    <- topic_labels_short
-V(g)$cluster  <- cluster
-V(g)$size     <- props * 800
-V(g)$topic_nr <- paste0("T", 1:25)
-E(g)$weight   <- E(g)$weight
-tg <- as_tbl_graph(g)
+saveRDS(corr, file.path(OUT, paste0("topic_corr_huge_K", K_FINAL, ".rds")))
+cat("Topic correlations saved.\n")
 
-set.seed(42)
-p_corr <- ggraph(tg, layout = "fr") +
-  geom_edge_link(aes(width = weight, alpha = weight), color = "grey60") +
-  scale_edge_width(range = c(0.3, 2), guide = "none") +
-  scale_edge_alpha(range = c(0.2, 0.8), guide = "none") +
-  geom_node_point(aes(size = size, color = cluster)) +
-  geom_node_text(aes(label = topic_nr),
-                 size = 3.5, color = "white", fontface = "bold") +
-  geom_node_text(aes(label = label),
-                 size = 4, color = "grey20",
-                 repel = TRUE, max.overlaps = Inf,
-                 box.padding = 0.1, point.padding = 0.8,
-                 force = 2, nudge_y = 0.15, segment.color = NA) +
-  scale_color_manual(values = c(
-    "Markt & Produkt"     = "#2980B9",
-    "Gesellschaft & Tech" = "#27AE60",
-    "European VC"         = "#8E44AD",
-    "Peripher"            = "#95A5A6",
-    "Artefakt"            = "#E74C3C")) +
-  scale_size(range = c(6, 18), guide = "none") +
-  labs(title    = "Topic Correlation Network (K = 25)",
-       subtitle = "Node size = mean topic prevalence · Edge width = correlation strength",
-       color    = "Discourse cluster") +
-  theme_void(base_size = 22) +
-  theme(plot.title      = element_text(face = "bold", size = 20, hjust = 0.5),
-        plot.subtitle   = element_text(size = 20, hjust = 0.5, color = "grey40"),
-        legend.position = "bottom",
-        legend.title    = element_text(size = 20),
-        plot.margin     = margin(20, 20, 20, 20))
-
-ggsave(file.path(OUT, "plot_topic_network_K25.pdf"), p_corr, width = 18, height = 15, dpi = 150)
-ggsave(file.path(OUT, "plot_topic_network_K25.png"), p_corr, width = 18, height = 15, dpi = 150)
-cat("Saved: plot_topic_network_K25.pdf / .png\n")
-
-# ── 11. Done ──────────────────────────────────────────────────────────────────
+# ── 11. Done ───────────────────────────────────────────────────────────────────
 cat("\n============================================================\n")
-cat("All plots saved to:", OUT, "\n")
-cat("Files:\n")
-cat("  plot_fund_type_K25.pdf\n")
-cat("  plot_post_chatgpt_K25.pdf\n")
-cat("  plot_geography_K25.pdf\n")
-cat("  plot_year_ai_K25.pdf\n")
-cat("  plot_topic_network_K25.pdf / .png\n")
+cat("STM COMPLETE\n")
 cat("============================================================\n")
+cat("K =", K_FINAL, "| Corpus:", nrow(docs), "documents\n")
+cat("Output:", OUT, "\n")
+cat("\nFiles saved:\n")
+cat(paste0("  stm_K", K_FINAL, ".rds\n"))
+cat(paste0("  top_words_K", K_FINAL, ".csv\n"))
+cat(paste0("  topic_proportions_K", K_FINAL, ".csv\n"))
+cat(paste0("  effects_K", K_FINAL, ".rds\n"))
+cat(paste0("  effects_fund_type_K", K_FINAL, ".pdf\n"))
+cat(paste0("  effects_post_chatgpt_K", K_FINAL, ".pdf\n"))
+cat(paste0("  effects_year_top6_K", K_FINAL, ".pdf\n"))
+cat(paste0("  effects_geography_K", K_FINAL, ".pdf\n"))
+cat(paste0("  stability_K", K_FINAL, ".rds\n"))
+cat("  filter_log.csv\n")

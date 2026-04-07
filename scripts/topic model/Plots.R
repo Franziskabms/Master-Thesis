@@ -15,15 +15,17 @@ OUT  <- file.path(BASE, "Topic Model/STM/output")
 # ── 1. Load model ─────────────────────────────────────────────────────────────
 cat("Loading model...\n")
 stm_model <- readRDS(file.path(OUT, "stm_K25.rds"))
-effects   <- readRDS(file.path(OUT, "effects_K25.rds"))
+stm_input <- readRDS(file.path(OUT, "stm_input_K25.rds"))
 corr      <- readRDS(file.path(OUT, "topic_corr_huge_K25.rds"))
 
 # ── 2. Re-estimate effects ────────────────────────────────────────────────────
+# Note: stm_input_K25.rds must exist — generate from stm_final.R if missing
 cat("Estimating effects...\n")
+stm_input <- readRDS(file.path(OUT, "stm_input_K25.rds"))
 effects_full <- estimateEffect(
   formula     = 1:25 ~ fund_type + geography + year_c + post_chatgpt,
   stmobj      = stm_model,
-  metadata    = effects$data,
+  metadata    = stm_input$meta,
   uncertainty = "Global"
 )
 
@@ -118,7 +120,7 @@ plot_effects(df_chatgpt,
              xlab     = "Effect (post vs. pre ChatGPT, Nov 2022)",
              filename = "plot_post_chatgpt_K25.pdf")
 
-# ── 8. Plot 3: Geography ─────────────────────────────────────────────────────
+# ── 8. Plot 3: Geography ──────────────────────────────────────────────────────
 cat("Plot 3: Geography effect...\n")
 df_geo <- extract_effects(effects_full, "geographyUS", K, topic_labels)
 plot_effects(df_geo,
@@ -178,7 +180,7 @@ cluster <- c(
 )
 
 props <- colMeans(stm_model$theta)
-adj   <- corr$posadj
+adj   <- as.matrix(corr$poscor)
 diag(adj) <- 0
 g <- graph_from_adjacency_matrix(adj, mode = "undirected",
                                  weighted = TRUE, diag = FALSE)
@@ -190,7 +192,7 @@ E(g)$weight   <- E(g)$weight
 tg <- as_tbl_graph(g)
 
 set.seed(42)
-p_corr <- ggraph(tg, layout = "fr") +
+p_corr <- ggraph(tg, layout = "stress") +
   geom_edge_link(aes(width = weight, alpha = weight), color = "grey60") +
   scale_edge_width(range = c(0.3, 2), guide = "none") +
   scale_edge_alpha(range = c(0.2, 0.8), guide = "none") +
@@ -218,6 +220,11 @@ p_corr <- ggraph(tg, layout = "fr") +
         legend.position = "bottom",
         legend.title    = element_text(size = 20),
         plot.margin     = margin(20, 20, 20, 20))
+
+# Exploratory: inspect edge weight distribution
+str(corr$poscor)
+which(adj > 0.05, arr.ind = TRUE)
+adj[adj > 0.05]
 
 ggsave(file.path(OUT, "plot_topic_network_K25.pdf"), p_corr, width = 18, height = 15, dpi = 150)
 ggsave(file.path(OUT, "plot_topic_network_K25.png"), p_corr, width = 18, height = 15, dpi = 150)

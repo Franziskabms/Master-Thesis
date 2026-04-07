@@ -10,6 +10,8 @@ library(stm)
 library(jsonlite)
 library(tidyverse)
 library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textmodels)
 
 # ── 0. Paths ──────────────────────────────────────────────────────────────────
 BASE     <- path.expand("~/Documents/Master/Masterarbeit/MA/Code")
@@ -102,7 +104,6 @@ toks <- corp %>%
                   "think", "know", "said", "say", "go", "going", "come",
                   "take", "gives", "given", "across", "around", "within",
                   "without", "whether", "every", "already", "still",
-                  # remove podcast/speech markers
                   "yeah", "realli", "thing", "lot", "actual",
                   "right", "okay", "got", "talk", "uh")) %>%
   tokens_wordstem()
@@ -112,6 +113,9 @@ dfm_full <- dfm(toks) %>%
 
 cat("\nDFM dimensions:", dim(dfm_full), "\n")
 stm_input <- convert(dfm_full, to = "stm")
+
+saveRDS(stm_input, file.path(OUT, paste0("stm_input_K", K_FINAL, ".rds")))
+cat("stm_input saved.\n")
 
 # ── 6. Fit final model with K = 25 ─────────────────────────────────────────────
 # K selected based on k_search diagnostics:
@@ -132,8 +136,8 @@ stm_model <- stm(
   verbose    = TRUE
 )
 
-saveRDS(stm_model, file.path(OUT, paste0("stm_K", K_FINAL, ".rds")))
-cat("Model saved.\n")
+saveRDS(stm_input, file.path(OUT, "stm_input_K25.rds"))
+cat("stm_input saved.\n")
 
 # ── 7. Inspect topics ──────────────────────────────────────────────────────────
 cat("\n--- TOP WORDS PER TOPIC (FREX) ---\n")
